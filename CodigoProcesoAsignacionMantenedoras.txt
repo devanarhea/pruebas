@@ -1,0 +1,851 @@
+using Hangfire;
+using Hangfire.Console;
+using Hangfire.Logging;
+using Hangfire.Server;
+using Koa;
+using Koa.Configuration;
+using Koa.Domain.Entities;
+using Koa.Domain.Uow;
+using Koa.EntityHistory;
+using Koa.Extensions;
+using Koa.Localization;
+using Koa.Notifications;
+using Microsoft.EntityFrameworkCore;
+using Mmt.Authorization.Users;
+using Mmt.Configuration;
+using Mmt.Navigation;
+using Mmt.Notifications;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+
+namespace Mmt.Application.Worker
+{
+    public class MarkTakeoversAsPendingWorker : TakeoverWorkerBase
+    {
+        private readonly IEntityChangeSetReasonProvider _reasonProvider;
+        private readonly IMmtRepository<Takeover> _takeoverRepository;
+        private readonly ITakeoverDomainService _takeoverDomainService;
+        private readonly UserManager _userManager;
+        private readonly IActorAssignmentDomainService _actorAssignmentDomainService;
+        private readonly INotificationSubscriptionManager _notificationSubscriptionManager;
+        private readonly IMmtRepository<Work> _workRepository;
+        private readonly IMmtRepository<AssignamentRulesWorksInputsChannelsAllowed> _assignamentRulesWorksInputsChannelsAllowedRepository;
+        private readonly IMmtRepository<AssignamentRulesWorksCeeCh> _assignamentRulesWorksCeeChRepositoryRepository;
+        private readonly IMmtRepository<AssignamentRulesWorksPhotosTour> _assignamentRulesWorksPhotosTourRepository;
+        private readonly IMmtRepository<RealEstateType> _realEstateTypeRepository;
+        private readonly IMmtRepository<IntegrationIhubDocumental> _integrationIhubDocumentalRepository;
+        private readonly IMmtRepository<IntegrationIHUBMedia_ActivosECLight> _integrationIHUBMedia_ActivosECLight;
+        private readonly IMmtRepository<AssignamentRules> _assignamentRulesRepository;
+        private readonly IMmtRepository<TakeoverAdequacyRealEstate> _takeoverAdequacyRealEstateRepository;
+        private readonly IMmtRepository<ProvinceTaxation> _provinceTaxationRepository;
+        
+
+
+
+
+        public MarkTakeoversAsPendingWorker(ISettingManager settingManager,
+            IUnitOfWorkManager unitOfWorkManager,
+            IEntityChangeSetReasonProvider reasonProvider,
+            IMmtRepository<Takeover> takeoverRepository,
+            ITakeoverDomainService takeoverDomainService,
+            INotificationPublisher notificationPublisher,
+            IActorAssignmentDomainService actorAssignmentDomainService,
+            INotificationSubscriptionManager notificationSubscriptionManager,
+            IMmtRepository<Work> workRepository,
+            IMmtRepository<AssignamentRulesWorksInputsChannelsAllowed> assignamentRulesWorksInputsChannelsAllowedRepository,
+            IMmtRepository<AssignamentRulesWorksCeeCh> assignamentRulesWorksCeeChRepository,
+            IMmtRepository<AssignamentRulesWorksPhotosTour> assignamentRulesWorksPhotosTour,
+            IMmtRepository<RealEstateType> realEstateTypeRepository,
+            IMmtRepository<IntegrationIhubDocumental> integrationIhubDocumentalRepository,
+            IMmtRepository<IntegrationIHUBMedia_ActivosECLight> integrationIHUBMedia_ActivosECLight,
+            IMmtRepository<AssignamentRules> assignamentRulesRepository,
+            IMmtRepository<TakeoverAdequacyRealEstate> takeoverAdequacyRealEstateRepository,
+            IMmtRepository<ProvinceTaxation> provinceTaxationRepository,
+        UserManager userManager)
+            : base(settingManager, unitOfWorkManager, notificationPublisher, userManager)
+        {
+            _reasonProvider = reasonProvider;
+            _takeoverRepository = takeoverRepository;
+            _takeoverDomainService = takeoverDomainService;
+            _userManager = userManager;
+            _actorAssignmentDomainService = actorAssignmentDomainService;
+            _notificationSubscriptionManager = notificationSubscriptionManager;
+            _workRepository = workRepository;
+            _assignamentRulesWorksInputsChannelsAllowedRepository = assignamentRulesWorksInputsChannelsAllowedRepository;
+            _assignamentRulesWorksCeeChRepositoryRepository = assignamentRulesWorksCeeChRepository;
+            _assignamentRulesWorksPhotosTourRepository = assignamentRulesWorksPhotosTour;
+            _realEstateTypeRepository = realEstateTypeRepository;
+            _integrationIhubDocumentalRepository = integrationIhubDocumentalRepository;
+            _integrationIHUBMedia_ActivosECLight = integrationIHUBMedia_ActivosECLight;
+            _assignamentRulesRepository = assignamentRulesRepository;
+            _takeoverAdequacyRealEstateRepository = takeoverAdequacyRealEstateRepository;
+            _provinceTaxationRepository = provinceTaxationRepository;
+    }
+
+
+        protected override void Schedule()
+        {
+            var cron = SettingManager.GetSettingValue(AppSettingNames.WorkerCronMarkTakeoversAsPending);            
+            RecurringJob.AddOrUpdate(() => DoWork(null), cron, TimeZoneInfo.Local);
+        }
+
+        [KoaDisplayName(MmtConsts.LocalizationSourceName, nameof(MarkTakeoversAsPendingWorker))]
+        public override async Task DoWork(PerformContext context)
+        {
+            Context = context;
+            await MarkTakeoversAsPending();
+        }
+
+        private async Task MarkTakeoversAsPending()
+        {
+
+            var active = SettingManager.GetSettingValue(AppSettingNames.WorkerCronMarkTakeoversAsPendingActive);
+            if (active == "0")
+            {
+                Log($"El proceso está desactivado. Para su activación en la tabla Settings campo Name = App.Worker.Cron.MarkTakeoversAsPending.Active, establecer campo valor = 1");
+                return;
+            }
+
+            Log("STARTING TO MARK TAKEOVERS AS PENDING", ConsoleTextColor.Magenta);
+            var errors = 0;
+
+            try
+            {
+                LogQuery(Takeover.TableName);
+
+                using (var unitOfWork = UnitOfWorkManager.Begin())
+                {
+                    using (_reasonProvider.Use("Avance automático de estado"))
+                    {
+
+                        var takeovers = await _takeoverRepository.GetAll()
+                            .Include(x => x.RealEstates)
+                                .ThenInclude(x => x.RealEstate)
+                                    .ThenInclude(x => x.RealEstateType)
+                            .Include(t => t.Assistants)
+                                .ThenInclude(a => a.User)
+                            .Where(x => x.State == TakeoverStates.PendingAssignJobs && x.IsDeleted == false)
+                            .OrderByDescending(x => x.OperationDate)
+                            .ToListAsync();
+
+                        var activesRules = await _assignamentRulesRepository.GetAll().Where(x => x.ActiveRule == 1)
+                          .Include(x => x.ListOfAssignamentRuleProviderPortfolio)
+                              .ThenInclude(x => x.Portfolio)
+                          .Include(x => x.ListOfAssignamentRuleProviderPortfolio)
+                              .ThenInclude(x => x.Provider)
+                          .Include(x => x.ListOfAssignamentRulesProvinceProviders)
+                              .ThenInclude(x => x.Portfolio)
+                          .Include(x => x.ListOfAssignamentRulesProvinceProviders)
+                              .ThenInclude(x => x.Provider)
+                           .Include(x => x.ListOfAssignamentRulesProvinceProviders)
+                              .ThenInclude(x => x.ProvinceTaxation)
+                           .Include(x => x.ListOfAssignamentRuleProvider)
+                          .OrderByDescending(x => x.Id)
+                          .ToListAsync();
+
+                        if (activesRules.Count == 0)
+                        {
+                            Log($"No existe una regla de asignación de empresas mantenedoras activa. Por favor contacte con el administrador, o active una regla en la tabla AssignamentRules");
+                        }
+
+                        var activeRule = activesRules[0];
+
+                        Log("Mark as pending");
+                        Log($"Para la asignación automática de empresa mantenedora a las TPs, se va a proceder a aplicar las reglas de selección de empresa con identificador {activeRule.Id}");
+                        foreach (var takeoverToProcess in takeovers)
+                        {
+                            Log($"Procesando toma de posesion = {takeoverToProcess.Id}");
+
+                            // 1. Asignar empresas mantenedoras
+                            if (!await AssignProviders(takeoverToProcess, activeRule))
+                            {
+                                Log($"No ha sido posible realizar avance de estado automático de la toma de posesión. No ha sido posible asignar empresa mantenedora a la toma de posesión {takeoverToProcess.Id}");
+                                continue;
+                            }
+
+                            await CurrentUnitOfWork.SaveChangesAsync();
+
+                            // 2. Asignación de trabajos y avance de estado de la tp
+                            if (!await AssignWorks(takeoverToProcess))
+                            {
+                                Log($"No ha sido posible realizar avance de estado automático de la toma de posesión. No ha sido posible asignar trabajos mantenedora a la toma de posesión {takeoverToProcess.Id}");
+                                continue;
+                            }
+                            await CurrentUnitOfWork.SaveChangesAsync();
+                            Log($"Empresa mantenedora y trabajos asignados con éxito a la toma de posesión {takeoverToProcess.Id}. Se avanza su estado a estado 1 - Pendiente de toma.");
+
+                        }
+                        await unitOfWork.CompleteAsync();
+                    }
+                }
+                Log($"{nameof(MarkTakeoversAsPending)} - FINISHED", ConsoleTextColor.Magenta);
+
+            }
+            catch (Exception e)
+            {
+                Logger.Error(e.Message, e);
+                Log($"ERROR -> {e.Message}", logLevel: LogLevel.Error);
+                errors++;
+            }
+
+        }
+
+        private void LogQuery(string tableOrProcedure)
+        {
+            Log($"Query to [dbo].[{tableOrProcedure}]...");
+        }
+
+        private async Task<bool> AssignWorks(Takeover takeoverToProcess)
+        {
+            string workDetails = "";
+            List<int> takeoverIds = new List<int>() { takeoverToProcess.Id };
+            var takeovers = _takeoverRepository
+                    .GetAllIncluding(t => t.AdequacyProvider, t => t.Promotion, t => t.InputChannel)
+                        .Include(t => t.Homework)
+                            .ThenInclude(r => r.HomeworkType)
+                        .Include(t => t.RealEstates)
+                            .ThenInclude(r => r.RealEstate)
+                        .Include(t => t.Assistants)
+                            .ThenInclude(e => e.User)
+                    .Where(t => takeoverIds.Contains(t.Id))
+                    .ToList();
+            var takeover = takeovers[0];
+
+            var listInputChanelsAllowed = _assignamentRulesWorksInputsChannelsAllowedRepository.GetAll()
+                .Select(x => x.ListOfAssignamentRuleProviderPortfolio.Id).ToList();
+            if (!listInputChanelsAllowed.Contains(takeover.InputChannelId))
+            {
+                Log($"No se asignan trabajos a la toma de posesion con id {takeover.Id} ya que su canal de entrada {takeover.InputChannel.Name} " +
+                    "no se encuentra entre los canales de entrada permitidos para poder realizarse.");
+                return false;
+            }
+
+            List<int> workIds = GetWorkIds(takeoverToProcess, workDetails);
+
+            if (workIds.Count == 0)
+            {
+                Log($"No se asignan trabajos a la toma de posesion con id {takeover.Id} ya que su canal de entrada {takeover.InputChannel.Name} " +
+                    "no se encuentra entre los canales de entrada permitidos para poder realizarse.");
+                return false;
+            }
+
+            var works = _workRepository.GetAllList(w => workIds.Contains(w.Id));
+
+            await _takeoverDomainService.Complete(takeovers, works, false, workDetails);
+
+            Log($"Detalle del proceso de asignación de trabajos a la TP {takeoverToProcess.Id} => {workDetails}");
+
+            SendNotificationWithRedirect(takeover, takeover.Assistants.Select(u => u.User).Distinct(),
+                            NotificationNames.TakeoversCompleted, false);
+
+           await new NotificationHelper(_notificationSubscriptionManager)
+                    .SubscribeAsync(NotificationNames.OperationChatHasNewMessage,
+                        new EntityIdentifier(takeover.Operation.GetType(), takeover.Operation.Id),
+                    takeover.Assistants.Select(a => new UserIdentifier(1, a.User.Id)).ToArray());
+
+            Log($"Se han asignado los siguientes trabajos {string.Join(",", works.Select(x => x.Name).ToList())}");
+
+            return true;
+
+        }
+
+        private List<int> GetWorkIds(Takeover takeoverToProcess, string workDetails)
+        {
+
+            List<int> worksId = new List<int>();
+
+            if (DebeAgregarPackBasico(takeoverToProcess, ref workDetails))
+            {
+                worksId.Add((int)WorkEnumNames.PaqueteBasico);
+            }
+
+            if (DebeAgregarTrabajosDeLimpieza(takeoverToProcess, ref workDetails))
+            {
+                worksId.Add((int)WorkEnumNames.LimpiezayVaciado);
+            }
+
+            if (DebeAgregarTrabajoCEE(takeoverToProcess, ref workDetails))
+            {
+                worksId.Add((int)WorkEnumNames.CEE);
+            }
+
+            if (DebeAgregarTrabajoCH(takeoverToProcess, ref workDetails))
+            {
+                worksId.Add((int)WorkEnumNames.CH);
+            }
+
+            if (DebeAgregarTrabajoDeTourViurtual(takeoverToProcess, ref workDetails))
+            {
+                worksId.Add((int)WorkEnumNames.TourVirtual);
+            }
+
+            if (DebeAgregarTrabajoDeReportajeFotografico(takeoverToProcess, ref workDetails))
+            {
+                worksId.Add((int)WorkEnumNames.ReportajeFotografico);
+            }
+            if (takeoverToProcess.PortfolioId == 1) {
+                worksId.Add((int)WorkEnumNames.Otros);
+            }
+
+            return worksId;
+        }
+
+        private bool DebeAgregarTrabajoDeTourViurtual(Takeover takeoverToProcess, ref string workDetails)
+        {
+
+            // Si alguno de los activos tiene como necesario trabajo de tour según configuración y no tiene
+            // trabajo de tour en ihub se debe agregar trabajo tour a la toma de posesión.
+            foreach (var takeoverAdecuayRealEstate in takeoverToProcess.RealEstates)
+            {
+                var required = _assignamentRulesWorksPhotosTourRepository.GetAll()
+                    .Where(x => x.Business == takeoverAdecuayRealEstate.RealEstate.Business
+                    && x.RealEstateTypeName == takeoverAdecuayRealEstate.RealEstate.RealEstateType.Description)
+                    .Select(x => x.TourRequired)
+                    .ToList();
+
+                if (required.Count == 0)
+                {
+                    Log($"No se encuentra configuracion en AssignamentRulesWorksPhotosTourRepository para este tipo" +
+                        $" de activo = {takeoverAdecuayRealEstate.RealEstate.RealEstateType.Description} y negocio = {takeoverAdecuayRealEstate.RealEstate.Business}" +
+                        $". Id activo = {takeoverAdecuayRealEstate.RealEstate.ActiveId}");
+                    return false;
+                }
+
+                string necesitaTour = required[0];
+                workDetails += $" / Necesita trabajo de tour segun config. de base de datos: {necesitaTour.ToUpper()}";
+
+                if (necesitaTour.ToUpper().Contains("SI"))
+                {
+                    var ihubMediasData = _integrationIHUBMedia_ActivosECLight.GetAll()
+                        .Where(x => x.IdActivoPrinex.ToString() == takeoverAdecuayRealEstate.RealEstate.ActiveId)
+                        .ToList();
+                    if (ihubMediasData.Count() != 0)
+                    {
+                        var ihubMediaData = ihubMediasData[0];
+                        if (ihubMediaData.CorrespondeTour == null)
+                        {
+                            workDetails += $" / Se añade trabajo de tour ya que no existe el mismo en ihub media para el " +
+                                $"activo siguiente {takeoverAdecuayRealEstate.RealEstate.ActiveId} de la tp, o no porque no existe informacion de requerimiento de dicho trabajo.";
+                            return true;
+                        }
+                        else
+                        {
+                            if (ihubMediaData.CorrespondeTour.ToUpper() == "SI"
+                                && (ihubMediaData.ValidacionFotos == null || ihubMediaData.ValidacionFotos.ToUpper() == "KO")) // Solo usan actualmente campo ValidacionFotos para tour y fotos
+                            {
+                                workDetails += $" / Se añade trabajo de tour como requerido ya que los datos del repositorio de medias indican que corresponde tour, y este o está incorrecto o no existe. Para el " +
+                                $"activo siguiente {takeoverAdecuayRealEstate.RealEstate.ActiveId} de la tp.";
+                                return true;
+                            }
+                        }
+                    }
+                    else {
+                        workDetails += $" / Se añade trabajo de tour ya que no existe el mismo en ihub media para el " +
+                                $"activo siguiente {takeoverAdecuayRealEstate.RealEstate.ActiveId} de la tp, o no porque no existe informacion de requerimiento de dicho trabajo.";
+                        return true;
+                    }
+                }
+            }
+
+            return false;
+        }
+        
+        private bool DebeAgregarTrabajoDeReportajeFotografico(Takeover takeoverToProcess, ref string workDetails)
+        {
+            // Si alguno de los activos tiene como necesario trabajo de fotos según configuración y no tiene
+            // trabajo de fotos en ihub se debe agregar trabajo fotos a la toma de posesión.
+            foreach (var takeoverAdecuayRealEstate in takeoverToProcess.RealEstates)
+            {
+                var required = _assignamentRulesWorksPhotosTourRepository.GetAll()
+                    .Where(x => x.Business == takeoverAdecuayRealEstate.RealEstate.Business
+                    && x.RealEstateTypeName == takeoverAdecuayRealEstate.RealEstate.RealEstateType.Description)
+                    .Select(x => x.PhotoRequired)
+                    .ToList();
+
+                if (required.Count == 0)
+                {
+                    Log($"No se encuentra configuracion en AssignamentRulesWorksPhotosTourRepository para este tipo" +
+                        $" de activo = {takeoverAdecuayRealEstate.RealEstate.RealEstateType.Description} y negocio = {takeoverAdecuayRealEstate.RealEstate.Business}" +
+                        $". Id activo = {takeoverAdecuayRealEstate.RealEstate.ActiveId}");
+                    return false;
+                }
+
+                string necesitafotos = required[0];
+                workDetails += $" / Necesita trabajo de fotos segun config. de base de datos: {necesitafotos.ToUpper()}";
+
+                if (necesitafotos.ToUpper().Contains("SI"))
+                {
+                    var ihubMediasData = _integrationIHUBMedia_ActivosECLight.GetAll()
+                        .Where(x => x.IdActivoPrinex.ToString() == takeoverAdecuayRealEstate.RealEstate.ActiveId)
+                        .ToList();
+                    if (ihubMediasData.Count() != 0)
+                    {
+                        var ihubMediaData = ihubMediasData[0];
+                        if (ihubMediasData.Count == 0 || ihubMediaData.CorrespondeFoto == null)
+                        {
+                            workDetails += $" / Se añade trabajo de fotos ya que no existe el mismo en ihub media para el " +
+                                $"activo siguiente {takeoverAdecuayRealEstate.RealEstate.ActiveId} de la tp, o no porque no existe informacion de requerimiento de dicho trabajo.";
+                            return true;
+                        }
+                        else
+                        {
+                            if (ihubMediaData.CorrespondeFoto.ToUpper() == "SI"
+                                && (ihubMediaData.ValidacionFotos == null || ihubMediaData.ValidacionFotos.ToUpper() == "KO"))
+                            {
+                                workDetails += $" / Se añade trabajo de fotos como requerido ya que los datos del repositorio de medias indican que corresponde fotos, y este o está incorrecto o no existe. Para el " +
+                                $"activo siguiente {takeoverAdecuayRealEstate.RealEstate.ActiveId} de la tp.";
+                                return true;
+                            }
+                        }
+                    }
+                    else {
+                        workDetails += $" / Se añade trabajo de fotos ya que no existe el mismo en ihub media para el " +
+                                $"activo siguiente {takeoverAdecuayRealEstate.RealEstate.ActiveId} de la tp, o no porque no existe informacion de requerimiento de dicho trabajo.";
+                        return true;
+                    }
+                }
+            }
+
+            return false;
+        }
+
+        private bool DebeAgregarTrabajoCH(Takeover takeoverToProcess, ref string workDetails)
+        {
+            // mirar la config de bbdd si necesita o no Ch, alguno de los inmuebles que tenga la takeover.
+            int ContadorNecesitaChYTieneDocumentoEnRepo = 0;
+            foreach (var realestate in takeoverToProcess.RealEstates)
+            {
+
+                string ccaa = _provinceTaxationRepository.GetAll()
+                    .Where(x => x.Province == realestate.RealEstate.Province)
+                    .Select(x => x.CCAA)
+                    .First();
+
+                var config = _assignamentRulesWorksCeeChRepositoryRepository.GetAll()
+                .Where(x => x.RealEstateTypeName.ToUpper() == realestate.RealEstate.RealEstateType.Description.ToUpper()
+                    && x.CCAA.ToUpper() == ccaa.ToUpper())
+                .Select(x => x.ChRequired).ToList();
+
+                if (config.Count == 0)
+                {
+                    Log($"No se encuentra configuracion para este tipo de activo {realestate.RealEstate.RealEstateType.Description}" +
+                        $" y provincia {ccaa} en la tabla assignamentRulesWorksCeeCh. Id activo {realestate.RealEstate.ActiveId}");
+                    return false;
+                }
+
+                string necesitaCh = config[0];
+                workDetails += $" / Necesita Ch segun config. de base de datos: {necesitaCh.ToUpper()}";
+
+                if (necesitaCh.ToUpper().Contains("SI"))
+                {
+                    // si necesita -> si en alguno de los  documento en alguno de ellos, en ese caso añadirlo.
+
+                    var docsByExpedientNumber = _integrationIhubDocumentalRepository.GetAll()
+                        .Where(x => x.NumExpedienteInmueble.Equals(realestate.RealEstate.ExpedientNumber));
+
+                    List<string> ListOfDocumentType = new List<string>() { "Cédula de Habitabilidad o INH", "Cédula de habitabilidad", "Documentación técnica" };
+                    bool existeDocumentoEnIhubDocumental = docsByExpedientNumber.Where(x => ListOfDocumentType.Contains(x.TipoDocumento)).Count() > 0;
+                    if (!existeDocumentoEnIhubDocumental)
+                    {
+                        ContadorNecesitaChYTieneDocumentoEnRepo++;
+                    }
+                }
+            }
+
+            if (ContadorNecesitaChYTieneDocumentoEnRepo > 0)
+            {
+                workDetails += $" / Alguno de los inmuebles de la tp requiere trabajo de Ch. Se añade el trabajo de CH";
+                return true;
+            }
+            else
+            {
+                workDetails += $" / Niguno de los inmuebles de la tp requiere trabajo de Ch o todos los documentos CH ya existen en el repositorio de documentos. No se añade el trabajo de CH";
+                return false;
+            }
+
+        }
+
+        private bool DebeAgregarTrabajoCEE(Takeover takeoverToProcess, ref string workDetails)
+        {
+            // mirar la config de bbdd si necesita o no cee, alguno de los inmuebles que tenga la takeover.
+            int ContadorNecesitaCeeYTieneDocumentoEnRepo = 0;
+            foreach (var realestate in takeoverToProcess.RealEstates)
+            {
+                string ccaa = _provinceTaxationRepository.GetAll()
+                    .Where(x => x.Province == realestate.RealEstate.Province)
+                    .Select(x => x.CCAA)
+                    .First();
+
+                var config = _assignamentRulesWorksCeeChRepositoryRepository.GetAll()
+                .Where(x => x.RealEstateTypeName.ToUpper() == realestate.RealEstate.RealEstateType.Description.ToUpper()
+                    && x.CCAA.ToUpper() == ccaa.ToUpper())
+                .Select(x => x.CeeRequired).ToList();
+
+                if (config.Count == 0)
+                {
+                    Log($"No se encuentra configuracion para este tipo de activo {realestate.RealEstate.RealEstateType.Description}" +
+                        $" y CCAA {ccaa} en la tabla assignamentRulesWorksCeeCh. Id activo {realestate.RealEstate.ActiveId}");
+                    return false;
+                }
+
+                string necesitaCee = config[0];
+                workDetails += $" / Id activo {realestate.RealEstate.ActiveId} ¿necesita CEE segun config. de base de datos?: {necesitaCee.ToUpper()}";
+
+                if (necesitaCee.ToUpper().Contains("SI"))
+                {
+                    // si necesita -> si en alguno de los  documento en alguno de ellos, en ese caso añadirlo.
+
+                    var docsByExpedientNumber = _integrationIhubDocumentalRepository.GetAll()
+                        .Where(x => x.NumExpedienteInmueble.Equals(realestate.RealEstate.ExpedientNumber));
+                    
+                    List<string> ListOfDocumentType = new List<string>() { "Certificado", "Certificado de Eficiencia Energética", "Certificado energético" };
+                    bool existeDocumentoEnIhubDocumental = docsByExpedientNumber.Where(x => ListOfDocumentType.Contains(x.TipoDocumento)).Count() > 0;
+                    if (!existeDocumentoEnIhubDocumental)
+                    {
+                        ContadorNecesitaCeeYTieneDocumentoEnRepo++;
+                    }
+                }
+            }
+
+            if (ContadorNecesitaCeeYTieneDocumentoEnRepo > 0)
+            {
+                workDetails += $" / Alguno de los inmuebles de la tp requiere trabajo de CEE y este no existe en el repositorio. Se añade el trabajo de CEE como requerido";
+                return true;
+            }
+            else
+            {
+                workDetails += $" / Ninguno de los inmuebles de la tp requiere trabajo de CEE o todos ya tienen documento en el repositorio. No se añade el trabajo de CEE como requerido";
+            }
+
+            return false;
+        }
+
+        private bool DebeAgregarTrabajosDeLimpieza(Takeover takeoverToProcess, ref string workDetails)
+        {
+
+            if (takeoverToProcess.InputChannel.Name == "Activo con pre-toma")
+            {
+                workDetails = "Trabajos de limpieza y vaciado NO asignados automáticamente ya que el canal de entrada de la toma de posesión es 'Activo con pre-toma'";
+                return false;
+            }
+
+            var listOfVicasRealestateType = _realEstateTypeRepository.GetAll().Where(x => x.Vicas).Select(x => x.Id);
+            foreach (var activo in takeoverToProcess.RealEstates)
+            {
+                if (!listOfVicasRealestateType.Contains(activo.RealEstate.RealEstateType.Id))
+                {
+                    workDetails = $"Trabajos de limpieza y vaciado asignados automáticamente ya que alguno de los activos de la toma de posesión es un tipo de activo NO VICAS.";
+                    return true;
+                }                
+            }
+
+            return false;
+
+        }
+
+        private bool DebeAgregarPackBasico(Takeover takeoverToProcess, ref string workDetails)
+        {
+            // Si alguno de sus activos cumple con el criterio: tipo de activo vicas. Se añade el trabajo a la TP.
+
+            if (takeoverToProcess.InputChannel.Name == "Activo con pre-toma")
+            {
+                workDetails = "Pack básico NO asignado automáticamente ya que el canal de entrada de la toma de posesión es 'Activo con pre-toma'";
+                return false;
+            }
+
+            var listOfVicasRealestateType = _realEstateTypeRepository.GetAll().Where(x => x.Vicas).Select(x => x.Id);
+            foreach (var activo in takeoverToProcess.RealEstates)
+            {
+                if (listOfVicasRealestateType.Contains(activo.RealEstate.RealEstateType.Id))
+                {
+                    workDetails = $"Pack básico asignado automáticamente ya que alguno de los activos de la toma de posesión es un tipo de activo VICAS.";
+                    return true;
+                }
+                else if (activo.RealEstate.RealEstateType.Description == "Local comercial")
+                {
+                    workDetails = $"Pack básico asignado automáticamente ya que alguno de los activos de la toma de posesión es un local comercial.";
+                    return true;
+                }
+                
+            }
+
+            return false;
+        }
+
+        private async Task<bool> AssignProviders(Takeover takeoverToProcess, AssignamentRules activeRule)
+        {
+            Provider assignedProvider = GetProviderToAssign(takeoverToProcess, activeRule);
+
+            // Guardar asignación de proveedor al takeover
+            if (assignedProvider != null)
+            {
+                takeoverToProcess.AdequacyProviderId = assignedProvider.Id;
+                SaveAdequacyProvider(takeoverToProcess.Id, assignedProvider.Id);
+
+                // Actualizar contadores 
+                activeRule.TotalNumberAssignations += 1;
+                var assignamentRuleProvider = activeRule.ListOfAssignamentRuleProvider.First(x => x.Provider.Id == assignedProvider.Id);
+                assignamentRuleProvider.TotalNumberAssignations += 1;
+
+                Log($"Asignada a TP {takeoverToProcess.Id} la regla de asignacion {activeRule.Id}. " +
+                    $"Total asignaciones de la regla tras la asignación {activeRule.TotalNumberAssignations}. " +
+                    $"Total asignaciones de la empresa {assignedProvider.Name} con esta regla {assignamentRuleProvider.TotalNumberAssignations}");
+            }
+            else
+            {
+                Logger.Error($"No se encuentra una empresa mantenedora a asignar para el takeoverId {takeoverToProcess.Id}");
+                return false;
+            }
+
+            return true;
+        }
+
+
+        private Provider GetProviderToAssign(Takeover takeover, AssignamentRules activeRule)
+        {
+            // 1. Criterio de asignación por fecha de toma y proximidad.
+            // Buscar si ya existe alguna TP en MMT en estado 1 - Pendiente TP que tenga mismo código postal + población/localidad + calle
+            // y mismo día de la Toma de Posesión , para que en ese caso no se tengan en cuenta las reglas de asignación, y directamente el programa obtenga
+            // la empresa mantenedora que tiene asignada la tp ya existente, para asi asignar la misma mantenedora a la nueva TP 
+            // 
+            // 2. Asignación por citerios de prioridad y porcentaje.
+            // 2.1 Caso ambos checks (prioridad y porcentaje) estén desactivados:
+            //  - No se realiza avance de estado de tp y por tanto tampoco ninguna asignación automática.
+            // 2.2 Caso de que ambos checks están activados:
+            //  - Por cada tp, mirar según cartera y provincia la empresa de mayor prioridad. Comprobar si esa empresa ha cubierto su cupo de asignaciones. Si no
+            //  lo ha cubierto se le asigna la tp. Si lo ha cubierto se busca la empresa de siguiente prioridad, y se realiza el mismo proceso. Al asignar la tp
+            //  a una empresa se incrementará en 1 el total de asignaciones realizadas, y en 1 las asignaciones realizadas a la empresa en cuestión. Esos contadores 
+            //  nos permiten calcular el porcentaje de asignaciones (ocupación) actual por empresa.
+            // 2.3 Caso de que esté únicamente el check de prioridades activo:
+            //  - Irán todas las asignaciones a la empresa con mayor prioridad configurada por provincia, es decir, la que tenga prioridad 1. Si ninguna tiene configurada
+            //  prioridad, no se asignará ni se avanzará de estado la tp.
+            // 2.4 Caso de que esté únicamente el check de porcentajes activo:
+            //  - De entre las empresas que tengan porcentaje definido (porcentaje <> 0), se escogerá la que mayor porcentaje tenga y no esté completa, y en caso de igualdad
+            //  de porcentajes entre las empresas que no estén completas, se escogerá una de manera aleatoria. Cuestá cubierta (es decir porcentaje 
+            //  asignación real > que porcentaje configurado) se escogerá otra de manera aleatoria, y así sucesivamente.                        
+
+            // 1. Obtener proveedor a asignar según las reglas
+
+            try {
+                var takeoverAdequacyRealEstateOfTakeoverId = _takeoverAdequacyRealEstateRepository.GetAll()
+                    .Include(x => x.RealEstate)
+                    .Where(x => x.TakeoverId == takeover.Id)
+                    .FirstOrDefault();
+            
+                // Obtención del provider a asignar
+
+                // 1. Criterio de asignación por misma fecha de toma, y proximidad (cp, poblacion y calle.) PROBLEMA---> en la t. realestates no se guarda la calle sin número
+                // de momento por especificaciones temporales se hace por código postal
+
+                var takeoverAdequacyRealEstate = _takeoverAdequacyRealEstateRepository.GetAll()
+                    .Include(x => x.RealEstate)
+                    .Include(x => x.Takeover)
+                        .ThenInclude(x => x.Assistants)
+                    .Where(x =>
+                        x.Takeover.State == TakeoverStates.PendingTakeover
+                        && x.Takeover.OperationDate == takeover.OperationDate
+                        && x.RealEstate.PostalCode == takeoverAdequacyRealEstateOfTakeoverId.RealEstate.PostalCode)
+                    .ToList();
+
+                if (takeoverAdequacyRealEstate.Count > 0)
+                {
+                    Log($"Se aplica criterio por misma fecha de toma, y proximidad que la tp en estado 'pendiente tp' y con id tp = {takeoverAdequacyRealEstate[0].TakeoverId}");
+                    var user = takeoverAdequacyRealEstate[0].Takeover.Assistants.Where(a => a.IsAdequacyAssistant()).Select(x => x.User).FirstOrDefault();
+                    return user.Provider;
+                }
+
+                // 2. Asignación por citerios de prioridad y porcentaje.
+                // 2.1 Caso ambos checks (prioridad y porcentaje) estén desactivados:
+                //  - No se realiza avance de estado de tp y por tanto tampoco ninguna asignación automática.
+                if (activeRule.ActiveCriteriaPercentage == 0 && activeRule.ActiveCriteriaPriority == 0)
+                    return null;
+
+                // 2.3 Caso de que esté únicamente el check de prioridades activo:
+                //  - Irán todas las asignaciones a la empresa con mayor prioridad configurada por provincia, es decir, la que tenga prioridad 1.
+                //  Si ninguna tiene configurada prioridad, no se asignará ni se avanzará de estado la tp.
+                if (activeRule.ActiveCriteriaPriority == 1 && activeRule.ActiveCriteriaPercentage == 0)
+                {
+
+                    var ListPrioritiesFiltered = activeRule.ListOfAssignamentRulesProvinceProviders
+                        .Where(x => x.Portfolio.Id == takeover.PortfolioId
+                            && x.ProvinceTaxation.Province == takeoverAdequacyRealEstateOfTakeoverId.RealEstate.Province
+                            && x.Prioridad > 0)
+                        .OrderBy(x => x.Prioridad)
+                        .ToList();
+
+                    if (ListPrioritiesFiltered.Count == 0)
+                    {
+                        Log($"No existe al menos una prioridad configurada para las empresas mantenedoras del portfolio {takeover.PortfolioId} y provincia {takeoverAdequacyRealEstateOfTakeoverId.RealEstate.Province} ");
+                        return null;
+                    }
+
+                    return ListPrioritiesFiltered[0].Provider;
+                }
+                // 2.4 Caso de que esté únicamente el check de porcentajes activo:
+                //  - De entre las empresas que tengan porcentaje definido (porcentaje <> 0), se escogerá la que mayor porcentaje tenga y no esté completa,
+                //  y en caso de igualdad de porcentajes entre las empresas que no estén completas, se escogerá una de manera aleatoria. Cuestá cubierta
+                //  (es decir porcentaje asignación real > que porcentaje configurado) se escogerá otra de manera aleatoria, y así sucesivamente.
+                else if (activeRule.ActiveCriteriaPriority == 0 && activeRule.ActiveCriteriaPercentage == 1)
+                {
+                    var ListOfAssignamentRuleProviderPortfolioFiltered = activeRule.ListOfAssignamentRuleProviderPortfolio
+                        .Where(x => x.Portfolio.Id == takeover.PortfolioId
+                            && x.PorcentajeReparto > 0)
+                        .OrderByDescending(x => x.PorcentajeReparto)
+                        .ToList();
+
+                    foreach (var assignamentRuleProviderPortfolio in ListOfAssignamentRuleProviderPortfolioFiltered)
+                    {
+                        if (!ProviderIsFull(activeRule.TotalNumberAssignations,
+                            activeRule.ListOfAssignamentRuleProvider
+                            .Where(x => x.Provider.Id == assignamentRuleProviderPortfolio.Provider.Id).Select(x => x.TotalNumberAssignations).First(),
+                                assignamentRuleProviderPortfolio.PorcentajeReparto))
+                        {
+                            return assignamentRuleProviderPortfolio.Provider;
+                        }
+                    }
+                }
+                // 2.2 Caso de que ambos checks están activados:
+                //  - Por cada tp, mirar según cartera y provincia la empresa de mayor prioridad. Comprobar si esa empresa ha cubierto su cupo de asignaciones. Si no
+                //  lo ha cubierto se le asigna la tp. Si lo ha cubierto se busca la empresa de siguiente prioridad, y se realiza el mismo proceso. Al asignar la tp
+                //  a una empresa se incrementará en 1 el total de asignaciones realizadas, y en 1 las asignaciones realizadas a la empresa en cuestión. Esos contadores 
+                //  nos permiten calcular el porcentaje de asignaciones (ocupación) actual por empresa.
+                else
+                {
+                    var ListPrioritiesFiltered = activeRule.ListOfAssignamentRulesProvinceProviders
+                       .Where(x => x.Portfolio.Id == takeover.PortfolioId
+                           && x.ProvinceTaxation.Province == takeoverAdequacyRealEstateOfTakeoverId.RealEstate.Province
+                           && x.Prioridad > 0)
+                       .OrderBy(x => x.Prioridad)
+                       .ToList();
+
+                    foreach (var priorityConfig in ListPrioritiesFiltered)
+                    {
+                        int percentageConfigForPortfolioAndProvider = activeRule.ListOfAssignamentRuleProviderPortfolio
+                            .Where(x => x.Portfolio.Id == takeover.PortfolioId
+                                    && x.Provider.Id == priorityConfig.Provider.Id)
+                            .Select(x => x.PorcentajeReparto)
+                            .FirstOrDefault();
+                        if (!ProviderIsFull(activeRule.TotalNumberAssignations,
+                            activeRule.ListOfAssignamentRuleProvider
+                                .Where(x => x.Provider.Id == priorityConfig.Provider.Id).Select(x => x.TotalNumberAssignations).First(),
+                            percentageConfigForPortfolioAndProvider))
+                        {
+                            return priorityConfig.Provider;
+                        }
+                    }
+                }
+
+                return null;
+            }
+            catch (Exception e)
+            {
+                Log($"La TP {takeover.Id} no tiene inmuebles asociados por lo que no se puede procesar ");
+                return null;
+            }
+        }
+
+        private bool ProviderIsFull(int numAsignacionesTotPorRegla, int numAsignacionesTotPorEmpresa, int porcentajeAsignacionConfigurado)
+        {
+            double porcentajeAsignacionReal = (double)numAsignacionesTotPorEmpresa * 100 / (numAsignacionesTotPorRegla + 1);
+            return porcentajeAsignacionReal >= porcentajeAsignacionConfigurado;
+        }
+
+        public void SaveAdequacyProvider(int takeoverId, int providerId)
+        {
+            try
+            {
+                var takeover = _takeoverRepository
+                    .GetAll()
+                    .Include(t => t.Homework)
+                    .Include(t => t.Operation.Homework)
+                    .Include(t => t.Operation.Responsibles)
+                        .ThenInclude(r => r.User)
+                    .Include(t => t.Assistants)
+                        .ThenInclude(a => a.User)
+                    .FirstOrDefault(t => t.Id == takeoverId);
+
+                var previousActors = takeover.Assistants.Where(a => a.IsAdequacyAssistant()).Select(u => u.User).ToList();
+                var actors = _userManager.GetUsersByProviderIds(providerId);
+
+                _actorAssignmentDomainService.Assign(takeover, actors);
+
+                var previousActorIdentifiers = previousActors.Select(u => new UserIdentifier(1, u.Id)).ToArray();
+                var nextActorIdentifiers = actors.Select(u => new UserIdentifier(1, u.Id)).ToArray();
+
+                var takeoverIdentifier = new EntityIdentifier(takeover.GetType(), takeover.Id);
+
+                UnsubscribeAsync(NotificationNames.TakeoverChatHasNewMessage, takeoverIdentifier, previousActorIdentifiers);
+                SubscribeAsync(NotificationNames.TakeoverChatHasNewMessage, takeoverIdentifier, nextActorIdentifiers);
+
+                if (!(takeover.Operation is null))
+                {
+                    var operationIdentier = new EntityIdentifier(takeover.Operation.GetType(), takeover.Operation.Id);
+
+                    UnsubscribeAsync(NotificationNames.OperationChatHasNewMessage, operationIdentier, previousActorIdentifiers);
+                    SubscribeAsync(NotificationNames.OperationChatHasNewMessage, operationIdentier, nextActorIdentifiers);
+                }
+                
+
+                var newActorsIds = takeover.Assistants.Where(a => a.IsAdequacyAssistant()).Select(u => u.UserId).ToList();
+                var actorsRemoved = previousActors.Where(u => !newActorsIds.Contains(u.Id)).ToList();
+
+                SendNotificationWithRedirect(takeover, actorsRemoved, NotificationNames.TakeoversAdequacyProviderUserRemoved, false);
+
+                if (takeover.State != TakeoverStates.PendingAssignJobs)
+                    SendNotificationWithRedirect(takeover, actors, NotificationNames.TakeoversAdequacyProviderUserAssigned, false);
+
+            }
+            catch (Exception e)
+            {
+                throw e;
+            }
+        }
+
+        private void UnsubscribeAsync(string notificationName, EntityIdentifier entityIndentifier, params UserIdentifier[] userIdentifier)
+        {
+            var notificationHelper = new NotificationHelper(_notificationSubscriptionManager);
+
+            notificationHelper.Unsubscribe(notificationName, entityIndentifier, userIdentifier);
+        }
+
+        private void SubscribeAsync(string notificationName, EntityIdentifier entityIndentifier, params UserIdentifier[] userIdentifier)
+        {
+            var notificationHelper = new NotificationHelper(_notificationSubscriptionManager);
+
+            notificationHelper.Subscribe(notificationName, entityIndentifier, userIdentifier);
+        }
+
+        private void SendNotificationWithRedirect(Adequacy adequacy, IEnumerable<User> users, string notificationName, bool isOnlyForSuscribedUsers)
+        {
+            var message = $"{adequacy.Code}: {L(notificationName)}";
+            string redirectUri;
+            switch (adequacy)
+            {
+                case Operation _:
+                    redirectUri = string.Concat(AppRoutesNames.OperationManager.EnsureEndsWith('/'), adequacy.Id);
+                    break;
+                case Takeover _:
+                    redirectUri = string.Concat(AppRoutesNames.TakeoverDetailManager.EnsureEndsWith('/'), adequacy.Id);
+                    break;
+                default:
+                    throw new ArgumentOutOfRangeException(nameof(adequacy));
+            }
+            var data = new RedirectNotificationData(message, redirectUri);
+
+            if (!isOnlyForSuscribedUsers)
+            {
+                var entityIdentifier = new EntityIdentifier(adequacy.GetType(), adequacy.Id);
+                var userIdentifiers = _userManager.GetUserTakeover(users.Distinct().ToList());
+
+                _notificationPublisher.Publish(notificationName, data, entityIdentifier, NotificationSeverity.Warn, userIdentifiers);
+            }
+            else
+            {
+                _notificationPublisher.Publish(notificationName, data, null, NotificationSeverity.Warn);
+            }
+        }
+
+    }
+}
